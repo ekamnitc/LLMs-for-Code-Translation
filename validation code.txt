@@ -1,0 +1,170 @@
+!apt-get update -q
+!apt-get install -y openjdk-17-jdk maven
+!java -version
+!mvn -version
+# ============================
+# 0) Config – paths in Colab
+# ============================
+CODE_CSV = "/content/python_to_java_full_auto.csv"
+TEST_CSV = "/content/java_testcases_simplified.csv"  # optional (stdin per row)
+WORKDIR  = "/content/java_sanity"
+TIMEOUT_SECONDS = 5
+
+# ============================
+# 1) Imports & setup
+# ============================
+import os, re, subprocess, pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+
+BASE  = Path(WORKDIR)
+SRC   = BASE / "src"
+BUILD = BASE / "build"
+SRC.mkdir(parents=True, exist_ok=True)
+BUILD.mkdir(parents=True, exist_ok=True)
+
+print("Workspace:", BASE)
+
+# ============================
+# 2) Load CSVs
+# ============================
+df = pd.read_csv(CODE_CSV)
+
+# Use only the java_code column
+JAVA_COL = "java_code"
+
+# testcases CSV is optional; if present we’ll try to feed stdin
+stdin_map = {}
+if os.path.exists(TEST_CSV):
+    dt = pd.read_csv(TEST_CSV)
+    stdin_cols = [c for c in dt.columns if any(k in c.lower() for k in ["stdin","input","args","dummy"])]
+    if stdin_cols:
+        STDIN_COL = stdin_cols[0]
+        for i in range(min(len(df), len(dt))):
+            v = dt.loc[i, STDIN_COL]
+            stdin_map[i] = "" if (pd.isna(v)) else str(v)
+        print("Using stdin/test column:", STDIN_COL)
+    else:
+        print("No stdin-like column found in java_testcases_simplified.csv; running with empty stdin.")
+else:
+    print("No testcases CSV found; running with empty stdin.")
+
+# ============================
+# 3) Helpers
+# ============================
+CLASS_RE_PUBLIC = re.compile(r'\bpublic\s+class\s+([A-Za-z_]\w*)')
+CLASS_RE_ANY    = re.compile(r'\bclass\s+([A-Za-z_]\w*)')
+MAIN_RE         = re.compile(r'public\s+static\s+void\s+main\s*\(\s*String\[\]\s*\w*\s*\)')
+
+def strip_package(code: str) -> str:
+    return re.sub(r'^\s*package\s+[^;]+;\s*', '', code, count=1, flags=re.M)
+
+def infer_class_name(code: str, fallback: str) -> str:
+    m = CLASS_RE_PUBLIC.search(code) or CLASS_RE_ANY.search(code)
+    return m.group(1) if m else fallback
+
+def has_main(code: str) -> bool:
+    return MAIN_RE.search(code) is not None
+
+def write_java_file(code: str, fname: Path):
+    fname.write_text(code, encoding="utf-8")
+
+def compile_java(java_files):
+    cmd = ["javac", "-encoding", "UTF-8", "-d", str(BUILD)] + [str(f) for f in java_files]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+def run_java(class_name: str, stdin_text: str = ""):
+    cmd = ["java", "-cp", str(BUILD), class_name]
+    return subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
+
+# ============================
+# 4) Iterate, compile & run
+# ============================
+results = []
+for i, row in tqdm(df.iterrows(), total=len(df), desc="Validating"):
+    raw_code = str(row[JAVA_COL]) if not pd.isna(row[JAVA_COL]) else ""
+    idx = i + 1
+
+    code = strip_package(raw_code)
+    class_name = infer_class_name(code, fallback=f"Snippet{idx}")
+
+    wrapper_needed = not has_main(code)
+    src_files = []
+
+    snippet_path = SRC / f"{class_name}.java"
+    write_java_file(code, snippet_path)
+    src_files.append(snippet_path)
+
+    if wrapper_needed:
+        wrapper_name = f"Runner{idx}"
+        wrapper_code = f"""
+        public class {wrapper_name} {{
+            public static void main(String[] args) {{
+                try {{
+                    Class<?> c = Class.forName("{class_name}");
+                    try {{
+                        c.getDeclaredConstructor().newInstance();
+                    }} catch (NoSuchMethodException e) {{
+                        // No default constructor
+                    }}
+                }} catch (Throwable t) {{
+                    t.printStackTrace();
+                    System.exit(1);
+                }}
+            }}
+        }}
+        """.strip()
+        wrapper_path = SRC / f"{wrapper_name}.java"
+        write_java_file(wrapper_code, wrapper_path)
+        src_files.append(wrapper_path)
+        run_target = wrapper_name
+    else:
+        run_target = class_name
+
+    # Compile
+    comp = compile_java(src_files)
+    if comp.returncode != 0:
+        results.append({
+            "index": idx,
+            "class_name": class_name,
+            "status": "COMPILE FAIL",
+            "compile_stderr": comp.stderr[:500],
+            "runtime_stdout": "",
+            "runtime_stderr": ""
+        })
+        continue
+
+    # Run
+    stdin_text = stdin_map.get(i, "")
+    try:
+        runres = run_java(run_target, stdin_text=stdin_text)
+        status = "SUCCESS" if runres.returncode == 0 else "RUNTIME FAIL"
+        results.append({
+            "index": idx,
+            "class_name": class_name,
+            "status": status,
+            "compile_stderr": "",
+            "runtime_stdout": runres.stdout[:500],
+            "runtime_stderr": runres.stderr[:500]
+        })
+    except subprocess.TimeoutExpired:
+        results.append({
+            "index": idx,
+            "class_name": class_name,
+            "status": "TIMEOUT",
+            "compile_stderr": "",
+            "runtime_stdout": "",
+            "runtime_stderr": f"Process exceeded {TIMEOUT_SECONDS}s"
+        })
+
+# ============================
+# 5) Save results
+# ============================
+res_df = pd.DataFrame(results)
+out_csv = str(BASE / "sanity_results.csv")
+res_df.to_csv(out_csv, index=False)
+
+print("\nSummary:")
+print(res_df["status"].value_counts())
+print("\nSaved:", out_csv)
+res_df.head(10)

@@ -1,0 +1,100 @@
+# =======================================
+# 1. Install dependencies
+# =======================================
+!pip install transformers accelerate pandas tqdm
+
+import pandas as pd
+import json
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# =======================================
+# 2. Load full dataset
+# =======================================
+df = pd.read_csv("/content/python_snippets.csv")   # <-- upload file in Colab first
+codes = df["code"].tolist()
+
+# =======================================
+# 3. Choose DeepSeek-Coder model (GPU only)
+# =======================================
+model_name = "deepseek-ai/deepseek-coder-1.3b-instruct"  # safe for Colab T4 GPU
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    device_map="cuda",        # GPU only
+    torch_dtype=torch.float16 # efficient memory
+)
+
+# =======================================
+# 4. Translation function
+# =======================================
+def clean_java_output(text):
+    """Extract only the Java snippet (remove explanations/markdown)."""
+    # If fenced code block exists, take inside ```java ... ```
+    if "```java" in text:
+        text = text.split("```java", 1)[1]
+        if "```" in text:
+            text = text.split("```", 1)[0]
+    # Remove stray [INST] or explanations
+    text = text.replace("[/INST]", "").strip()
+    return text
+
+def translate_code(python_code):
+    prompt = f"""[INST] Convert the following Python code into equivalent Java code.
+Return only the Java code snippet, no explanations.
+
+Python code:
+{python_code}
+
+Java code: [/INST]"""
+
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.2,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id
+    )
+    java_code = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    if "Java code:" in java_code:
+        java_code = java_code.split("Java code:")[-1].strip()
+
+    return clean_java_output(java_code)
+
+# =======================================
+# 5. Process in 5 batches (50 rows each)
+# =======================================
+batch_size = 50
+num_batches = 5
+
+for batch_idx in range(num_batches):
+    start = batch_idx * batch_size
+    end = start + batch_size
+    batch_codes = codes[start:end]
+
+    results = []
+    print(f"\n🚀 Processing Batch {batch_idx+1} ({len(batch_codes)} rows)...")
+
+    for code in tqdm(batch_codes, desc=f"Batch {batch_idx+1}", ncols=80):
+        try:
+            java_code = translate_code(code)
+            results.append({
+                "python": code,
+                "java": java_code
+            })
+        except Exception as e:
+            results.append({
+                "python": code,
+                "java": f"Error: {e}"
+            })
+
+    # Save each batch as a separate JSON file
+    output_file = f"python_to_java_deepseek_batch{batch_idx+1}.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print(f"✅ Batch {batch_idx+1} saved as {output_file}")
